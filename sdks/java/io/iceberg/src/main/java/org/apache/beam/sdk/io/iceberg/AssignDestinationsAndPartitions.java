@@ -98,6 +98,7 @@ class AssignDestinationsAndPartitions
   static class AssignDoFn extends DoFn<Row, KV<Row, Row>> {
     private transient @MonotonicNonNull Map<String, PartitionKey> partitionKeys;
     private transient @MonotonicNonNull Map<String, BeamRowWrapper> wrappers;
+    private transient @MonotonicNonNull Map<String, Row> keyCache;
     private final DynamicDestinations dynamicDestinations;
     private final IcebergCatalogConfig catalogConfig;
     private final DistributionMode distributionMode;
@@ -118,6 +119,7 @@ class AssignDestinationsAndPartitions
     public void setup() {
       this.wrappers = new HashMap<>();
       this.partitionKeys = new HashMap<>();
+      this.keyCache = new HashMap<>();
     }
 
     @ProcessElement
@@ -166,12 +168,17 @@ class AssignDestinationsAndPartitions
         shardId = distributionFunction.apply(data);
       }
 
-      Row destAndPartition =
-          Row.withSchema(OUTPUT_SCHEMA)
-              .withFieldValue(DESTINATION, tableIdentifier)
-              .withFieldValue(PARTITION, partitionPath)
-              .withFieldValue(SHARD, shardId)
-              .build();
+      String cacheKey = tableIdentifier + "|" + partitionPath + "|" + shardId;
+      Row destAndPartition = checkStateNotNull(keyCache).get(cacheKey);
+      if (destAndPartition == null) {
+        destAndPartition =
+            Row.withSchema(OUTPUT_SCHEMA)
+                .addValue(tableIdentifier)
+                .addValue(partitionPath)
+                .addValue(shardId)
+                .build();
+        keyCache.put(cacheKey, destAndPartition);
+      }
       out.output(KV.of(destAndPartition, data));
     }
   }
