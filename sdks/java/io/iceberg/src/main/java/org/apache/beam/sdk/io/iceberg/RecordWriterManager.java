@@ -20,6 +20,8 @@ package org.apache.beam.sdk.io.iceberg;
 import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
 import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkState;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
@@ -29,12 +31,16 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import org.apache.beam.sdk.coders.RowCoder;
+import org.apache.beam.sdk.extensions.sorter.BufferedExternalSorter;
 import org.apache.beam.sdk.schemas.Schema;
 import org.apache.beam.sdk.util.Preconditions;
+import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.Row;
 import org.apache.beam.sdk.values.WindowedValue;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.annotations.VisibleForTesting;
@@ -98,25 +104,32 @@ class RecordWriterManager implements AutoCloseable {
     private final IcebergDestination icebergDestination;
     private final PartitionSpec spec;
     private final org.apache.iceberg.Schema schema;
-    // used to determine the partition to which a record belongs
-    // must not be directly used to create a writer
     private final PartitionKey routingPartitionKey;
     private final Table table;
     private final String stateToken = UUID.randomUUID().toString();
-    final Cache<PartitionKey, RecordWriter> writers;
     private final List<SerializableDataFile> dataFiles = Lists.newArrayList();
     @VisibleForTesting final Map<PartitionKey, Integer> writerCounts = Maps.newHashMap();
     private final Map<String, PartitionField> partitionFieldMap = Maps.newHashMap();
     private final List<Exception> exceptions = Lists.newArrayList();
-    private final InternalRecordWrapper wrapper; // wrapper that facilitates partitioning
+    private final InternalRecordWrapper wrapper;
+    private final boolean isSorted;
+    private final Schema beamSchema;
 
-    DestinationState(IcebergDestination icebergDestination, Table table) {
+    private final Map<PartitionKey, BufferedExternalSorter> sorters = new HashMap<>();
+    private @Nullable RowCoder rowCoder;
+    private String @Nullable[] sortColumnNames;
+
+    final Cache<PartitionKey, RecordWriter> writers;
+
+    DestinationState(IcebergDestination icebergDestination, Table table, Schema beamSchema) {
       this.icebergDestination = icebergDestination;
       this.schema = table.schema();
       this.spec = table.spec();
       this.routingPartitionKey = new PartitionKey(spec, schema);
       this.wrapper = new InternalRecordWrapper(schema.asStruct());
       this.table = table;
+      this.beamSchema = beamSchema;
+      this.isSorted = table.sortOrder() != null && table.sortOrder().isSorted();
       for (PartitionField partitionField : spec.fields()) {
         partitionFieldMap.put(partitionField.name(), partitionField);
       }
@@ -153,63 +166,141 @@ class RecordWriterManager implements AutoCloseable {
               .build();
     }
 
-    /**
-     * Computes the partition key for this Iceberg {@link Record} and writes it using the
-     * appropriate {@link RecordWriter}, creating new writers as needed.
-     *
-     * <p>However, if this {@link RecordWriterManager} is already saturated with writers, and we
-     * can't create a new writer, the {@link Record} is rejected and {@code false} is returned.
-     */
-    boolean write(Record record) {
+    boolean write(Row row) {
+      Record record = IcebergUtils.beamRowToIcebergRecord(schema, row);
       routingPartitionKey.partition(wrapper.wrap(record));
+      PartitionKey key = routingPartitionKey.copy();
 
-      @Nullable RecordWriter writer = writers.getIfPresent(routingPartitionKey);
-      if (writer == null && openWriters >= maxNumWriters) {
-        return false;
+      if (isSorted) {
+        return writeSorted(row, key);
+      } else {
+        return writeUnsorted(record, key);
       }
-      writer = fetchWriterForPartition(routingPartitionKey, writer);
+    }
+
+    private void initSorterState() {
+      if (rowCoder == null) {
+        rowCoder = RowCoder.of(beamSchema);
+        List<org.apache.iceberg.SortField> fields = table.sortOrder().fields();
+        sortColumnNames = new String[fields.size()];
+        for (int i = 0; i < fields.size(); i++) {
+          sortColumnNames[i] = schema.findColumnName(fields.get(i).sourceId());
+        }
+      }
+    }
+
+    private boolean writeSorted(Row row, PartitionKey key) {
+      initSorterState();
+      try {
+        BufferedExternalSorter sorter = sorters.computeIfAbsent(
+            key, k -> BufferedExternalSorter.create(BufferedExternalSorter.options()));
+        ByteArrayOutputStream keyBaos = new ByteArrayOutputStream();
+        ByteArrayOutputStream valBaos = new ByteArrayOutputStream();
+        IcebergRowSorter.encodeSortKey(
+            row, table.sortOrder(), sortColumnNames, keyBaos, schema, beamSchema);
+        rowCoder.encode(row, valBaos);
+        sorter.add(KV.of(keyBaos.toByteArray(), valBaos.toByteArray()));
+      } catch (IOException e) {
+        throw new RuntimeException("Failed to add row to external sorter", e);
+      }
+      return true;
+    }
+
+    private boolean writeUnsorted(Record record, PartitionKey key) {
+      @Nullable RecordWriter writer = writers.getIfPresent(key);
+      if (writer == null && openWriters >= maxNumWriters) {
+        writers.cleanUp();
+        if (openWriters >= maxNumWriters) {
+          return false;
+        }
+      }
+      writer = fetchWriterForPartition(key, writer);
       writer.write(record);
       return true;
     }
 
-    /**
-     * Checks if a viable {@link RecordWriter} already exists for this partition and returns it. If
-     * no {@link RecordWriter} exists or if it has reached the maximum limit of bytes written, a new
-     * one is created and returned.
-     */
     private RecordWriter fetchWriterForPartition(
         PartitionKey partitionKey, @Nullable RecordWriter recordWriter) {
       if (recordWriter == null || recordWriter.bytesWritten() > maxFileSize) {
-        // each writer must have its own PartitionKey object
         PartitionKey copy = partitionKey.copy();
-        // calling invalidate for a non-existent key is a safe operation
         writers.invalidate(copy);
-        recordWriter = createWriter(copy);
+        int recordIndex = writerCounts.merge(partitionKey, 1, Integer::sum);
+        try {
+          recordWriter =
+              new RecordWriter(
+                  table,
+                  icebergDestination.getFileFormat(),
+                  filePrefix + "_" + stateToken + "_" + recordIndex,
+                  copy);
+          openWriters++;
+        } catch (IOException e) {
+          throw new RuntimeException(
+              String.format(
+                  "Encountered an error when creating a RecordWriter for table '%s', partition %s.",
+                  icebergDestination.getTableIdentifier(), partitionKey),
+              e);
+        }
         writers.put(copy, recordWriter);
       }
       return recordWriter;
     }
 
-    private RecordWriter createWriter(PartitionKey partitionKey) {
-      // keep track of how many writers we opened for each destination-partition path
-      // use this as a prefix to differentiate the new path.
-      // this avoids overwriting a data file written by a previous writer in this destination state.
-      int recordIndex = writerCounts.merge(partitionKey, 1, Integer::sum);
+    private void flushSortedPartition(PartitionKey partitionKey) throws IOException {
+      BufferedExternalSorter sorter = sorters.remove(partitionKey);
+      if (sorter == null) {
+        return;
+      }
+
+      String partitionPath = getPartitionDataPath(partitionKey.toPath(), partitionFieldMap);
+      long targetFileSize = Long.parseLong(
+          table.properties().getOrDefault("write.target-file-size-bytes", "536870912"));
+
+      RecordWriter writer = createSortedWriter(partitionKey);
       try {
-        RecordWriter writer =
-            new RecordWriter(
-                table,
-                icebergDestination.getFileFormat(),
-                filePrefix + "_" + stateToken + "_" + recordIndex,
-                partitionKey);
-        openWriters++;
-        return writer;
-      } catch (IOException e) {
-        throw new RuntimeException(
-            String.format(
-                "Encountered an error when creating a RecordWriter for table '%s', partition %s.",
-                icebergDestination.getTableIdentifier(), partitionKey),
-            e);
+        for (KV<byte[], byte[]> kv : sorter.sort()) {
+          if (writer.bytesWritten() >= targetFileSize) {
+            writer.close();
+            dataFiles.add(SerializableDataFile.from(writer.getDataFile(), partitionPath));
+            writer = createSortedWriter(partitionKey);
+          }
+          ByteArrayInputStream bais = new ByteArrayInputStream(kv.getValue());
+          Row row = rowCoder.decode(bais);
+          Record rec = IcebergUtils.beamRowToIcebergRecord(schema, row);
+          writer.write(rec);
+        }
+      } finally {
+        writer.close();
+      }
+      if (writer.bytesWritten() > 0) {
+        dataFiles.add(SerializableDataFile.from(writer.getDataFile(), partitionPath));
+      }
+    }
+
+    private RecordWriter createSortedWriter(PartitionKey partitionKey) throws IOException {
+      int recordIndex = writerCounts.merge(partitionKey, 1, Integer::sum);
+      return new RecordWriter(
+          table,
+          icebergDestination.getFileFormat(),
+          filePrefix + "_" + stateToken + "_" + recordIndex,
+          partitionKey);
+    }
+
+    void flushAll() throws IOException {
+      if (isSorted) {
+        for (PartitionKey key : new ArrayList<>(sorters.keySet())) {
+          flushSortedPartition(key);
+        }
+      } else {
+        writers.invalidateAll();
+        if (!exceptions.isEmpty()) {
+          IllegalStateException exception =
+              new IllegalStateException(
+                  String.format("Encountered %s failed writer(s).", exceptions.size()));
+          for (Exception e : exceptions) {
+            exception.addSuppressed(e);
+          }
+          throw exception;
+        }
       }
     }
   }
@@ -399,11 +490,10 @@ class RecordWriterManager implements AutoCloseable {
             destination -> {
               IcebergDestination dest = destination.getValue();
               Table table = getOrCreateTable(dest, row.getSchema());
-              return new DestinationState(dest, table);
+              return new DestinationState(dest, table, row.getSchema());
             });
 
-    Record icebergRecord = IcebergUtils.beamRowToIcebergRecord(destinationState.schema, row);
-    return destinationState.write(icebergRecord);
+    return destinationState.write(row);
   }
 
   /**
@@ -417,19 +507,7 @@ class RecordWriterManager implements AutoCloseable {
           windowedDestinationAndState : destinations.entrySet()) {
         DestinationState state = windowedDestinationAndState.getValue();
 
-        // removing writers from the state's cache will trigger the logic to collect each writer's
-        // data file.
-        state.writers.invalidateAll();
-        // first check for any exceptions swallowed by the cache
-        if (!state.exceptions.isEmpty()) {
-          IllegalStateException exception =
-              new IllegalStateException(
-                  String.format("Encountered %s failed writer(s).", state.exceptions.size()));
-          for (Exception e : state.exceptions) {
-            exception.addSuppressed(e);
-          }
-          throw exception;
-        }
+        state.flushAll();
 
         if (state.dataFiles.isEmpty()) {
           continue;
