@@ -65,6 +65,7 @@
 ## I/Os
 
 * Support for X source added (Java/Python) ([#X](https://github.com/apache/beam/issues/X)).
+* [IcebergIO] Added opt-in sorted write support (`withSortedWrites()` / `sort_on_write`) to write data files in the table's sort order, spilling to local disk via Beam's external sorter for groups that exceed memory. Also added `DistributionMode.RANGE` with a user-supplied `withDistributionFunction(...)`, which shards a partition into non-overlapping key ranges so each shard becomes its own sorted file(s) (Java) ([#38406](https://github.com/apache/beam/issues/38406)).
 
 ## New Features / Improvements
 
@@ -110,7 +111,6 @@
 * BigQueryIO now supports reading BigQuery Lakehouse runtime catalog (BigLake metastore) Iceberg tables with the Storage Read API, using 4-part `project.catalog.namespace.table` identifiers (or a `TableReference` with a composite `catalog.namespace` dataset id). Previously such references were silently mis-parsed (Java) ([#39597](https://github.com/apache/beam/issues/39597)) .
 * SolaceIO now supports reading and writing binary and text content data payload (Java) ([#39875](https://github.com/apache/beam/issues/39875)).
 * ClickHouseIO: support writing `Decimal(P, S)` / `Decimal32/64/128/256` columns (Java) ([#39840](https://github.com/apache/beam/issues/39840)).
-* SolaceIO now supports reading and writing user properties (message metadata) (Java) ([#40099](https://github.com/apache/beam/issues/40099)).
 * [IcebergIO] AddFiles (`IcebergAddFiles` in YAML) can evolve the table schema before registering files, with `schema_evolution_options`, `required_columns`, `incompatible_schema_handling` and `unverifiable_file_handling` (Java/YAML, batch only) ([#40144](https://github.com/apache/beam/issues/40144)).
 * [IcebergIO] Added batch and streaming CDC writes that applies INSERT/UPDATE_BEFORE/UPDATE_AFTER/DELETE changes to Iceberg V2+ tables by primary key. Invoke with `IcebergIO.writeCdcRows` (Java) or by setting `mode: merge-on-read` on the Managed `ICEBERG` write (Java, Python, YAML) ([#39979](https://github.com/apache/beam/issues/39979)).
 * [IcebergIO] Added an optional side-input table cache for writes to significantly reduce catalog and table requests for large pipelines. A single worker polls the table and broadcasts it to other workers in the pipeline. Enable with `IcebergIO.writeRows(...).withSideInputTableCache()` (Java) or by setting `use_side_input_table_cache: true` on the Managed `ICEBERG` write (Java, Python) ([#39723](https://github.com/apache/beam/issues/39723)).
